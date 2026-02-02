@@ -68,8 +68,3 @@ python src\main.py
 ## 開発者向けメモ
 - エントリポイント: `src/main.py` の `run()` 関数
 - GUI コンポーネント: `src/ui/`、ゲームロジック: `src/controller/game_controller.py`、データ処理: `src/model/answer_list.py`
-
----
-
-問題がなければこの README の内容で反映済みです。必要なら `requirements.txt` の追加や `src/__init__.py` の作成も行います。
-
