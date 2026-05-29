@@ -5,6 +5,9 @@ from typing import Callable, Iterable, List, Optional
 from ..model.answer_list import AnswerList
 from ..model.player import Player
 from ..utils.text_norm import normalize_text
+from ..utils.logger import get_logger
+
+logger = get_logger('game_controller')
 
 # callback types
 NotificationCB = Callable[[str, str], None]
@@ -75,6 +78,7 @@ class GameController:
     def _notify(self, level: str, message: str) -> None:
         if self.on_notification:
             self.on_notification(level, message)
+        logger.info(f"[{level}] {message}")
 
     def _emit_player_state(self, p: Player) -> None:
         if self.on_player_state:
@@ -126,12 +130,16 @@ class GameController:
                 self.on_answers_updated(remaining, answered)
             self._notify("info", f"読み込み完了: {meta['total']} 件")
             self._emit_all_players()
+        except FileNotFoundError as e:
+            logger.error(f"CSV file not found: {path}", exc_info=True)
+            self._notify("error", f"ファイルが見つかりません: {path}")
         except Exception as e:
+            logger.error(f"CSV loading error: {e}", exc_info=True)
             self._notify("error", f"CSV 読み込みエラー: {e}")
 
     def add_player(self, name: str, base_seconds: int, pass_limit: int, wrong_answer_limit: int) -> None:
         if not name or len(name) > 60:
-            self._notify("error", "名前を1〜60文字で入力してください")
+            self._notify("error", "名���を1〜60文字で入力してください")
             return
         if self._name_exists(name):
             self._notify("error", f"同名のプレイヤーが既に存在します: {name}")
@@ -155,9 +163,16 @@ class GameController:
             self._notify("info", f"プレイヤー削除: {removed} 件")
         else:
             self._notify("error", f"プレイヤーが見つかりません: {name}")
-        self.current_idx = max(0, min(self.current_idx, max(0, len(self.players)-1)))
+        self._clamp_current_idx()
         self._emit_all_players()
         self._emit_current_player()
+
+    def _clamp_current_idx(self) -> None:
+        """Clamp current_idx to valid range. Fix for IndexError when players list is empty."""
+        if not self.players:
+            self.current_idx = 0
+        else:
+            self.current_idx = max(0, min(self.current_idx, len(self.players) - 1))
 
     def start_game(self) -> None:
         if not self.answer_list:
@@ -189,6 +204,22 @@ class GameController:
         self._emit_current_player()
         self._emit_running_state()
 
+    def reset_answers(self) -> None:
+        """Public API: Reset all answered items back to remaining."""
+        if self.answer_list is None:
+            logger.warning("Attempted to reset answers when answer_list is None")
+            return
+        try:
+            self.answer_list.used.clear()
+            self._answered_order.clear()
+            if self.on_answers_updated:
+                remaining = list(self.answer_list.items)
+                self.on_answers_updated(remaining, [])
+            self._notify("info", "回答状態をリセットしました")
+        except Exception as e:
+            logger.error(f"Error resetting answers: {e}", exc_info=True)
+            self._notify("error", f"リセット中にエラーが発生しました: {e}")
+
     def host_submit_answer(self, text: str) -> None:
         p = self.current_player()
         if p is None:
@@ -213,15 +244,16 @@ class GameController:
                 end = text.rfind(')')
                 if start < end:
                     answer_text = text[start+1:end]
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to extract answer text from parentheses: {e}")
         
         # pass previous class to matching to allow short form matching
         prev_class = getattr(self, '_last_answered_class', None)
         matched_disp = None
         try:
             matched_disp = self.answer_list.find_match(answer_text, previous_class=prev_class)
-        except Exception:
+        except Exception as e:
+            logger.error(f"Error finding match: {e}", exc_info=True)
             matched_disp = None
         is_correct = matched_disp is not None
         p.record_answer(text, is_correct)
@@ -243,8 +275,8 @@ class GameController:
                     if cv and t_norm.startswith(cv):
                         self._last_answered_class = cv
                         break
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Error inferring class: {e}")
 
         if is_correct:
             # mark used and record chronology (store display string in _answered_order)
@@ -256,8 +288,8 @@ class GameController:
                 if used_disp:
                     if used_disp not in self._answered_order:
                         self._answered_order.append(used_disp)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Error marking answer as used: {e}", exc_info=True)
             # notify UI about moved item (remaining, answered newest-first)
             if self.on_answers_updated:
                 remaining = [i for i in self.answer_list.items if i not in self.answer_list.used]
@@ -267,8 +299,8 @@ class GameController:
             if self.on_sound_event:
                 try:
                     self.on_sound_event('correct')
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.error(f"Error emitting sound event: {e}", exc_info=True)
             p.reset_wrong_answers()  # reset wrong answer count on correct
 
             try:
@@ -277,8 +309,8 @@ class GameController:
                     cls_key = getattr(self.answer_list, '_class_map', {}).get(used_disp)
                     if cls_key:
                         self._last_answered_class = cls_key
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Error updating last answered class: {e}")
 
             self._notify("info", f"{p.name} が正解しました: {text}")
             self._emit_player_state(p)
@@ -297,8 +329,8 @@ class GameController:
                 if self.on_sound_event:
                     try:
                         self.on_sound_event('wrong')
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.error(f"Error emitting sound event: {e}", exc_info=True)
         self._emit_all_players()
         self._emit_current_player()
 
@@ -327,14 +359,14 @@ class GameController:
             if display_key in self.answer_list.used:
                 try:
                     self.answer_list.used.discard(display_key)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.error(f"Error removing from used set: {e}", exc_info=True)
                 # remove from chronology if present
                 try:
                     if display_key in self._answered_order:
                         self._answered_order.remove(display_key)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.error(f"Error removing from answered order: {e}", exc_info=True)
                 # notify UI
                 if self.on_answers_updated:
                     remaining = [i for i in self.answer_list.items if i not in self.answer_list.used]
@@ -346,6 +378,7 @@ class GameController:
                 self._notify("info", f"項目が回答済みではありません: {display_key}")
                 return False
         except Exception as e:
+            logger.error(f"Error unmarking answer: {e}", exc_info=True)
             self._notify("error", f"内部エラー: {e}")
             return False
 
@@ -412,15 +445,15 @@ class GameController:
             # treat as Stop pressed
             try:
                 self.stop_game()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Error stopping game: {e}", exc_info=True)
             return True
         if self.answer_list and self.answer_list.remaining_count() == 0:
             # treat as Stop pressed
             try:
                 self.stop_game()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Error stopping game: {e}", exc_info=True)
             return True
         return False
     
@@ -455,8 +488,7 @@ class GameController:
             return
 
         self.players = new_players
-        # ensure current_idx remains valid (clamp)
-        self.current_idx = max(0, min(self.current_idx, max(0, len(self.players)-1)))
+        self._clamp_current_idx()
         # notify UI of the new full ordering and current highlight
         self._emit_all_players()
         self._emit_current_player()
@@ -497,9 +529,7 @@ class GameController:
         insert_at = max(0, min(insert_at, len(self.players)))
         self.players.insert(insert_at, p)
 
-        # keep current_idx valid
-        self.current_idx = max(0, min(self.current_idx, max(0, len(self.players)-1)))
-
+        self._clamp_current_idx()
         self._emit_all_players()
         self._emit_current_player()
 
