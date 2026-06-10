@@ -1,5 +1,6 @@
 import os
 import time
+from functools import lru_cache
 
 from PySide6.QtCore import QTimer, QUrl
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -8,6 +9,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QMainWindow,
+    QMessageBox,
     QVBoxLayout,
     QWidget,
 )
@@ -19,11 +21,14 @@ from ..config import (
     get_sound_path,
     sound_exists,
 )
+from ..utils.logger import get_logger
 from .answer_list_panel import AnswerListPanel
 from .csv_panel import CsvPanel
 from .game_state_panel import GameStatePanel
 from .notification_view import NotificationView
 from .player_panel import PlayerPanel
+
+logger = get_logger('windows')
 
 
 class MainWindow(QMainWindow):
@@ -41,57 +46,52 @@ class MainWindow(QMainWindow):
         left_col.setSpacing(6)
 
         # CSV panel above PlayerPanel
-        self.csv_panel = CsvPanel(load_callback=None)  # windows will handle QFileDialog -> set_path_after_load
+        self.csv_panel = CsvPanel(load_callback=None)
         # wire load button to open dialog and call controller.load_csv
         def _open_dialog_and_load():
-            # default folder: project/data/answer_list
             start_dir = os.path.join(os.getcwd(), "data", "answer_list")
             path, _ = QFileDialog.getOpenFileName(self, "Load CSV", start_dir, "CSV Files (*.csv);;All Files (*)")
             if path:
-                # set label and call controller.load_csv
                 self.csv_panel.set_path_after_load(path)
-                if hasattr(self.controller, "load_csv"):
-                    try:
+                try:
+                    if hasattr(self.controller, "load_csv"):
                         self.controller.load_csv(path)
-                    except Exception:
-                        pass
-        # assign a small wrapper as load_callback so CsvPanel._on_clicked will call it
+                except Exception as e:
+                    logger.error(f"Failed to load CSV: {e}", exc_info=True)
+        
         self.csv_panel.load_callback = _open_dialog_and_load
-
         left_col.addWidget(self.csv_panel)
 
         # PlayerPanel (top)
         self.player_panel = PlayerPanel()
         left_col.addWidget(self.player_panel, 0)
 
-        # Game state panel (middle) - GameStatePanel now uses horizontal player/time
-        # provide small wrappers to act on the current player for forfeit/skip
+        # Game state panel (middle)
         def _forfeit_current():
             try:
                 cur = self.controller.current_player()
                 if cur and hasattr(self.controller, "forfeit_player"):
                     self.controller.forfeit_player(cur.name)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Error forfeiting player: {e}", exc_info=True)
 
         def _skip_current():
             try:
                 cur = self.controller.current_player()
                 if cur and hasattr(self.controller, "skip_player"):
                     self.controller.skip_player(cur.name)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Error skipping player: {e}", exc_info=True)
 
-        # --- start: wrap start_callback to show reset dialog if answered list is not empty ---
         def _start_game_with_reset_check():
-            # If remaining list is empty (all items answered), automatically reset answers
+            """Start game with optional reset of answered items."""
             try:
                 al = getattr(self.controller, "answer_list", None)
-            except Exception:
+            except Exception as e:
+                logger.error(f"Error getting answer_list: {e}", exc_info=True)
                 al = None
 
             if al is None:
-                # nothing loaded, just start as usual
                 if hasattr(self.controller, "start_game"):
                     self.controller.start_game()
                 return
@@ -102,22 +102,16 @@ class MainWindow(QMainWindow):
             if len(remaining) == 0 and len(answered) > 0:
                 # all items are answered -> force reset and start from beginning
                 try:
-                    al.used.clear()
-                    if hasattr(self.controller, '_answered_order'):
-                        self.controller._answered_order.clear()
-                    if hasattr(self.controller, 'on_answers_updated'):
-                        rem = [i for i in al.items if i not in al.used]
-                        ans = []
-                        self.controller.on_answers_updated(rem, ans)
-                except Exception:
-                    pass
+                    if hasattr(self.controller, "reset_answers"):
+                        self.controller.reset_answers()
+                except Exception as e:
+                    logger.error(f"Error resetting answers: {e}", exc_info=True)
                 if hasattr(self.controller, "start_game"):
                     self.controller.start_game()
                 return
 
-            # If there are answered items but still some remaining, ask user whether to reset or continue
+            # If there are answered items but still some remaining, ask user
             if len(answered) > 0:
-                from PySide6.QtWidgets import QMessageBox
                 mb = QMessageBox(self)
                 mb.setWindowTitle("開始方法の選択")
                 mb.setText("回答済みリストが残っています。どの状態で開始しますか？")
@@ -129,21 +123,14 @@ class MainWindow(QMainWindow):
                 if clicked is btn_cancel:
                     return
                 if clicked is btn_restart:
-                    # reset answers and start
                     try:
-                        al.used.clear()
-                        if hasattr(self.controller, '_answered_order'):
-                            self.controller._answered_order.clear()
-                        if hasattr(self.controller, 'on_answers_updated'):
-                            rem = [i for i in al.items if i not in al.used]
-                            ans = []
-                            self.controller.on_answers_updated(rem, ans)
-                    except Exception:
-                        pass
+                        if hasattr(self.controller, "reset_answers"):
+                            self.controller.reset_answers()
+                    except Exception as e:
+                        logger.error(f"Error resetting answers: {e}", exc_info=True)
                     if hasattr(self.controller, "start_game"):
                         self.controller.start_game()
                     return
-                # clicked is continue: fall through to start without reset
             # default: start game
             if hasattr(self.controller, "start_game"):
                 self.controller.start_game()
@@ -160,7 +147,7 @@ class MainWindow(QMainWindow):
         gs_frame.setFrameShape(QFrame.Panel)
         gs_frame.setFrameShadow(QFrame.Raised)
         gs_layout = QVBoxLayout(gs_frame)
-        gs_layout.setContentsMargins(6,6,6,6)
+        gs_layout.setContentsMargins(6, 6, 6, 6)
         gs_layout.addWidget(self.game_state)
         left_col.addWidget(gs_frame, 0)
 
@@ -172,12 +159,9 @@ class MainWindow(QMainWindow):
         left_widget = QWidget()
         left_widget.setLayout(left_col)
 
-        # Right: two lists horizontally side-by-side (tall vertical lists)
+        # Right: answer lists
         right_col = QHBoxLayout()
         right_col.setSpacing(10)
-
-        # right side: answer lists widget (remaining / answered)
-        # arrange vertically: lists above
         right_v = QVBoxLayout()
         right_v.setSpacing(6)
         self.answer_lists = AnswerListPanel()
@@ -189,264 +173,17 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(left_widget, 3)
         root_layout.addWidget(right_widget, 2)
-
         self.setCentralWidget(central)
 
-        # player_panel signals
-        if hasattr(self.player_panel, "request_add_player"):
-            self.player_panel.request_add_player.connect(self._on_add_player_from_panel)
-        if hasattr(self.player_panel, "request_remove_player"):
-            self.player_panel.request_remove_player.connect(self.controller.remove_player)
-        if hasattr(self.player_panel, "request_reorder_players"):
-            # prefer controller.reorder_players_by_name if it exists
-            if hasattr(self.controller, "reorder_players_by_name"):
-                    self.player_panel.request_reorder_players.connect(self.controller.reorder_players_by_name)
-            else:
-                # fallback: connect to a no-op or wrapper
-                self.player_panel.request_reorder_players.connect(lambda order: None)
-        if hasattr(self.player_panel, "request_move_player"):
-            if hasattr(self.controller, "move_player"):
-                self.player_panel.request_move_player.connect(self.controller.move_player)
-            else:
-                self.player_panel.request_move_player.connect(lambda name, idx: None)
-        if hasattr(self.player_panel, "request_forfeit"):
-            if hasattr(self.controller, "forfeit_player"):
-                self.player_panel.request_forfeit.connect(self.controller.forfeit_player)
-            else:
-                self.player_panel.request_forfeit.connect(lambda name: None)
-        if hasattr(self.player_panel, "request_skip"):
-            if hasattr(self.controller, "skip_player"):
-                self.player_panel.request_skip.connect(self.controller.skip_player)
-            else:
-                self.player_panel.request_skip.connect(lambda name: None)
-
-        # controller -> UI callbacks
-        if hasattr(self.controller, "register_notification"):
-            self.controller.register_notification(self.notification_view.show_notification)
-        if hasattr(self.controller, "register_player_added"):
-            self.controller.register_player_added(self.player_panel.on_player_added)
-        if hasattr(self.controller, "register_player_state"):
-            self.controller.register_player_state(self._on_player_state)
-        if hasattr(self.controller, "register_answer_list_loaded"):
-            self.controller.register_answer_list_loaded(self._on_answer_list_loaded)
-        # new: answers updated callback to update the AnswerListPanel and GameStatePanel completer
-        def _on_answers_updated(remaining, answered):
-            # format items for display: "display（match）"
-            try:
-                mm = getattr(self.controller.answer_list, '_match_map', {}) if getattr(self.controller, 'answer_list', None) is not None else {}
-            except Exception:
-                mm = {}
-            formatted_rem = [f"{d}（{mm.get(d, '')}）" if mm.get(d) else str(d) for d in remaining]
-            formatted_ans = [f"{d}（{mm.get(d, '')}）" if mm.get(d) else str(d) for d in answered]
-            # Store raw keys in answer_lists BEFORE updating UI (so they're available when items are clicked)
-            self.answer_lists._remaining_keys = list(remaining)
-            self.answer_lists._answered_keys = list(answered)
-            # update answer lists panel with formatted labels and preserve raw keys
-            self.answer_lists.on_answers_updated(formatted_rem, formatted_ans)
-            # update completer suggestions with raw keys (game_state expects raw display keys)
-            if hasattr(self.game_state, "update_answer_suggestions"):
-                try:
-                    self.game_state._match_map = mm
-                except Exception:
-                    pass
-                # When hide-remaining is enabled, do not provide suggestions to the completer
-                try:
-                    if getattr(self, '_hide_remaining', False):
-                        # supply empty list to ensure popup/suggestions are suppressed
-                        self.game_state.update_answer_suggestions([])
-                    else:
-                        self.game_state.update_answer_suggestions(list(remaining))
-                except Exception:
-                    pass
-        if hasattr(self.controller, "register_answers_updated"):
-            self.controller.register_answers_updated(_on_answers_updated)
-        # connect double-click on remaining list to mark answer as correct, but only when game is running
-        if hasattr(self.answer_lists, "request_mark_answer") and hasattr(self.controller, "host_submit_answer"):
-            def _on_remaining_mark(text):
-                try:
-                    if not getattr(self.controller, 'is_running', False):
-                        return
-                    # text may be formatted as 'display（match）' — extract match if present
-                    match_text = None
-                    try:
-                        if '（' in text and '）' in text:
-                            start = text.rfind('（')
-                            end = text.rfind('）')
-                            match_text = text[start+1:end]
-                        else:
-                            # fallback: try to lookup match from answer_list
-                            match_text = getattr(self.controller.answer_list, '_match_map', {}).get(text, text)
-                    except Exception:
-                        match_text = text
-                    self.controller.host_submit_answer(match_text)
-                except Exception:
-                    pass
-            self.answer_lists.request_mark_answer.connect(_on_remaining_mark)
-        # connect double-click on answered list to move item back to remaining
-        if hasattr(self.answer_lists, 'request_unmark_answer') and hasattr(self.controller, 'unmark_answer'):
-            def _on_unmark_request(text):
-                try:
-                    # text is now the normalized display key directly from AnswerListPanel
-                    # (no need to parse formatted text anymore)
-                    if text:
-                        self.controller.unmark_answer(text)
-                except Exception:
-                    pass
-            self.answer_lists.request_unmark_answer.connect(_on_unmark_request)
-
-        # sound toggle connection (CsvPanel emits request_toggle_sound)
-        # Initialize _sound_enabled from the CSV panel checkbox (default OFF)
-        try:
-            self._sound_enabled = bool(self.csv_panel.sound_checkbox.isChecked())
-        except Exception:
-            self._sound_enabled = False
-        if hasattr(self.csv_panel, 'request_toggle_sound'):
-            try:
-                self.csv_panel.request_toggle_sound.connect(lambda s: setattr(self, '_sound_enabled', bool(s)))
-            except Exception:
-                pass
-
-        # Prepare cached media players to reduce playback latency for short sounds.
-        # Map filename -> (QMediaPlayer, QAudioOutput)
-        self._sound_players = {}
-
-        def _play_sound_internal(filename, volume=0.9):
-            try:
-                if not getattr(self, '_sound_enabled', False):
-                    return
-                if not sound_exists(filename):
-                    return
-                fname = get_sound_path(filename)
-                # Reuse a cached player when possible to avoid load latency
-                pair = self._sound_players.get(filename)
-                if pair is None:
-                    player = QMediaPlayer(self)
-                    audio = QAudioOutput(self)
-                    audio.setVolume(float(volume))
-                    player.setAudioOutput(audio)
-                    player.setSource(QUrl.fromLocalFile(fname))
-                    # keep in cache
-                    self._sound_players[filename] = (player, audio)
-                    pair = (player, audio)
-                    # cleanup when finished (not removing cache, just avoid leak)
-                    def _on_state_changed(state, player=player, filename=filename):
-                        try:
-                            from PySide6.QtMultimedia import QMediaPlayer
-
-                            # If ended or stopped, ensure position reset so next play starts at beginning
-                            if state == QMediaPlayer.StoppedState:
-                                try:
-                                    player.setPosition(0)
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                    try:
-                        player.playbackStateChanged.connect(_on_state_changed)
-                    except Exception:
-                        pass
-                else:
-                    player, audio = pair
-                    try:
-                        audio.setVolume(float(volume))
-                    except Exception:
-                        pass
-                player, audio = self._sound_players[filename]
-                try:
-                    # reset to start for immediate playback
-                    player.setPosition(0)
-                except Exception:
-                    pass
-                try:
-                    player.play()
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-        # expose helper as method-like attribute for internal use
-        self._play_sound = _play_sound_internal
-
-        # countdown toggle connection (initialize from UI checkbox)
-        try:
-            self._countdown_enabled = bool(self.csv_panel.countdown_checkbox.isChecked())
-        except Exception:
-            self._countdown_enabled = False
-        if hasattr(self.csv_panel, 'request_toggle_countdown'):
-            try:
-                self.csv_panel.request_toggle_countdown.connect(lambda s: setattr(self, '_countdown_enabled', bool(s)))
-            except Exception:
-                pass
-        # register for sound events from controller
-        if hasattr(self.controller, 'register_sound_event'):
-            try:
-                self.controller.register_sound_event(self._on_sound_event)
-            except Exception:
-                pass
-
-        # key-input pause state
-        # When True, typing or IME composition will pause the countdown
-        self._keypause_enabled = True
-        self._keypause_until = 0.0
-        self._last_countdown_second = None
-        # IME composition flag
-        self._is_composing = False
-        # Track remaining_ms at turn start for 10-second beep detection
-        # Format: {player_name: remaining_ms_at_start}
-        self._player_remaining_at_turn_start = {}
-        self.game_state.typing_event.connect(self._on_answer_typing)
-        # pause_on_typing is provided by AnswerListPanel now
-        # listen for IME composition changes from game state
-        if hasattr(self.game_state, 'composition_event'):
-            self.game_state.composition_event.connect(self._on_composition_changed)
-        # New: connect save CSV button
-        if hasattr(self.answer_lists, 'request_save_csv'):
-            self.answer_lists.request_save_csv.connect(self._on_save_csv)
-        # listen for hide-remaining toggle from AnswerListPanel
-        if hasattr(self.answer_lists, 'request_toggle_hide_remaining'):
-            self.answer_lists.request_toggle_hide_remaining.connect(self._on_hide_remaining_toggled)
-        # track hide-remaining state so we can suppress completer suggestions when enabled
-        self._hide_remaining = False
-        # New: connect typing pause checkbox from answer list panel
-        if hasattr(self.answer_lists, 'request_toggle_typing_pause'):
-            self.answer_lists.request_toggle_typing_pause.connect(lambda v: setattr(self, '_keypause_enabled', v))
-        self.controller.register_player_state(self._on_player_state)
-        self.controller.register_game_ended(lambda reason: self.notification_view.show_notification("info", f"ゲーム終了: {reason}"))
-        self.controller.register_all_players(self.player_panel.on_all_player_states)
-        # Combine all current_player callbacks into one handler
-        def _on_current_player_changed(player_name):
-            # Update player panel highlighting
-            if hasattr(self.player_panel, 'highlight_current_player'):
-                try:
-                    self.player_panel.highlight_current_player(player_name)
-                except Exception:
-                    pass
-            # Update game state panel
-            if hasattr(self.game_state, 'set_current_player'):
-                try:
-                    self.game_state.set_current_player(player_name)
-                except Exception:
-                    pass
-            # Reset countdown turn state when player changes
-            try:
-                self._player_remaining_at_turn_start.clear()
-                # clear per-player announcement flags
-                keys_to_clear = [k for k in vars(self).keys() if k.startswith('_last_announced_intervals_') or k.startswith('_announced_timeout_')]
-                for k in keys_to_clear:
-                    delattr(self, k)
-            except Exception:
-                pass
-        self.controller.register_current_player(_on_current_player_changed)
-        self.controller.register_running_state(self._on_running_state_changed)
+        # Register UI callbacks
+        self._register_player_panel_callbacks()
+        self._register_controller_callbacks()
+        self._setup_sound_system()
+        self._setup_timing_controls()
 
         # initial states
         self.player_panel.set_player_controls_enabled(True)
         self.game_state.set_controls_enabled(not self.controller.is_running)
-        # initialize keypause flag from UI checkbox default
-        try:
-            self._keypause_enabled = bool(self.answer_lists.pause_on_typing_cb.isChecked())
-        except Exception:
-            pass
 
         # periodic UI refresh
         self._refresh_timer = QTimer(self)
@@ -454,27 +191,147 @@ class MainWindow(QMainWindow):
         self._refresh_timer.timeout.connect(self._on_tick_refresh)
         self._refresh_timer.start()
 
-    def _on_add_player_from_panel(self, name: str, base_seconds: int, pass_limit: int, wrong_answer_limit: int):
-        self.controller.add_player(name, base_seconds, pass_limit, wrong_answer_limit)
-
-    def _on_answer_typing(self):
-        now = time.monotonic()
-        self._keypause_until = now + 1.0
-        self.controller._last_tick_monotonic = now
-
-    def _on_composition_changed(self, composing: bool):
-        """Handle IME composition start/end.
-        When composition state changes we flag `_is_composing` and reset
-        controller._last_tick_monotonic so that paused duration isn't counted
-        when ticking resumes (prevents time jump).
-        """
-        import time
-        self._is_composing = bool(composing)
+    def _register_player_panel_callbacks(self) -> None:
+        """Register all player panel signal callbacks."""
         try:
-            # reset controller tick base so elapsed during composition isn't applied
-            self.controller._last_tick_monotonic = time.monotonic()
+            if hasattr(self.player_panel, "request_add_player"):
+                self.player_panel.request_add_player.connect(self._on_add_player_from_panel)
+            if hasattr(self.player_panel, "request_remove_player"):
+                self.player_panel.request_remove_player.connect(self.controller.remove_player)
+            if hasattr(self.player_panel, "request_reorder_players"):
+                if hasattr(self.controller, "reorder_players_by_name"):
+                    self.player_panel.request_reorder_players.connect(self.controller.reorder_players_by_name)
+            if hasattr(self.player_panel, "request_move_player"):
+                if hasattr(self.controller, "move_player"):
+                    self.player_panel.request_move_player.connect(self.controller.move_player)
+            if hasattr(self.player_panel, "request_forfeit"):
+                if hasattr(self.controller, "forfeit_player"):
+                    self.player_panel.request_forfeit.connect(self.controller.forfeit_player)
+            if hasattr(self.player_panel, "request_skip"):
+                if hasattr(self.controller, "skip_player"):
+                    self.player_panel.request_skip.connect(self.controller.skip_player)
+        except Exception as e:
+            logger.error(f"Error registering player panel callbacks: {e}", exc_info=True)
+
+    def _register_controller_callbacks(self) -> None:
+        """Register all controller signal callbacks."""
+        try:
+            if hasattr(self.controller, "register_notification"):
+                self.controller.register_notification(self.notification_view.show_notification)
+            if hasattr(self.controller, "register_player_added"):
+                self.controller.register_player_added(self.player_panel.on_player_added)
+            if hasattr(self.controller, "register_player_state"):
+                self.controller.register_player_state(self._on_player_state)
+            if hasattr(self.controller, "register_answer_list_loaded"):
+                self.controller.register_answer_list_loaded(self._on_answer_list_loaded)
+            if hasattr(self.controller, "register_answers_updated"):
+                self.controller.register_answers_updated(self._on_answers_updated)
+            if hasattr(self.controller, "register_sound_event"):
+                self.controller.register_sound_event(self._on_sound_event)
+            if hasattr(self.controller, "register_all_players"):
+                self.controller.register_all_players(self.player_panel.on_all_player_states)
+            if hasattr(self.controller, "register_current_player"):
+                self.controller.register_current_player(self._on_current_player_changed)
+            if hasattr(self.controller, "register_running_state"):
+                self.controller.register_running_state(self._on_running_state_changed)
+            if hasattr(self.controller, "register_game_ended"):
+                self.controller.register_game_ended(
+                    lambda reason: self.notification_view.show_notification("info", f"ゲーム終了: {reason}")
+                )
+        except Exception as e:
+            logger.error(f"Error registering controller callbacks: {e}", exc_info=True)
+
+    def _register_answer_list_callbacks(self) -> None:
+        """Register answer list panel callbacks."""
+        try:
+            if hasattr(self.answer_lists, "request_mark_answer") and hasattr(self.controller, "host_submit_answer"):
+                self.answer_lists.request_mark_answer.connect(self._on_remaining_mark)
+            if hasattr(self.answer_lists, "request_unmark_answer") and hasattr(self.controller, "unmark_answer"):
+                self.answer_lists.request_unmark_answer.connect(self._on_unmark_request)
+            if hasattr(self.answer_lists, "request_save_csv"):
+                self.answer_lists.request_save_csv.connect(self._on_save_csv)
+            if hasattr(self.answer_lists, "request_toggle_hide_remaining"):
+                self.answer_lists.request_toggle_hide_remaining.connect(self._on_hide_remaining_toggled)
+            if hasattr(self.answer_lists, "request_toggle_typing_pause"):
+                self.answer_lists.request_toggle_typing_pause.connect(lambda v: setattr(self, '_keypause_enabled', v))
+        except Exception as e:
+            logger.error(f"Error registering answer list callbacks: {e}", exc_info=True)
+
+    def _setup_sound_system(self) -> None:
+        """Initialize sound system and media players."""
+        try:
+            self._sound_enabled = bool(self.csv_panel.sound_checkbox.isChecked())
+        except Exception:
+            self._sound_enabled = False
+        
+        try:
+            self._countdown_enabled = bool(self.csv_panel.countdown_checkbox.isChecked())
+        except Exception:
+            self._countdown_enabled = False
+        
+        # Sound toggle connections
+        if hasattr(self.csv_panel, 'request_toggle_sound'):
+            try:
+                self.csv_panel.request_toggle_sound.connect(lambda s: setattr(self, '_sound_enabled', bool(s)))
+            except Exception as e:
+                logger.error(f"Error connecting sound toggle: {e}")
+        
+        if hasattr(self.csv_panel, 'request_toggle_countdown'):
+            try:
+                self.csv_panel.request_toggle_countdown.connect(lambda s: setattr(self, '_countdown_enabled', bool(s)))
+            except Exception as e:
+                logger.error(f"Error connecting countdown toggle: {e}")
+        
+        # Cached media players
+        self._sound_players = {}
+        self._sound_player_cache_max = 10  # Limit cache size
+
+    def _setup_timing_controls(self) -> None:
+        """Initialize timing and pause controls."""
+        self._keypause_enabled = True
+        self._keypause_until = 0.0
+        self._last_countdown_second = None
+        self._is_composing = False
+        self._player_remaining_at_turn_start = {}
+        self._hide_remaining = False
+        
+        try:
+            if hasattr(self.game_state, 'typing_event'):
+                self.game_state.typing_event.connect(self._on_answer_typing)
+            if hasattr(self.game_state, 'composition_event'):
+                self.game_state.composition_event.connect(self._on_composition_changed)
+        except Exception as e:
+            logger.error(f"Error setting up timing controls: {e}", exc_info=True)
+        
+        # Register answer list callbacks after setup
+        self._register_answer_list_callbacks()
+        
+        try:
+            self._keypause_enabled = bool(self.answer_lists.pause_on_typing_cb.isChecked())
         except Exception:
             pass
+
+    def _on_add_player_from_panel(self, name: str, base_seconds: int, pass_limit: int, wrong_answer_limit: int):
+        try:
+            self.controller.add_player(name, base_seconds, pass_limit, wrong_answer_limit)
+        except Exception as e:
+            logger.error(f"Error adding player: {e}", exc_info=True)
+
+    def _on_answer_typing(self):
+        try:
+            now = time.monotonic()
+            self._keypause_until = now + 1.0
+            self.controller._last_tick_monotonic = now
+        except Exception as e:
+            logger.error(f"Error handling answer typing: {e}", exc_info=True)
+
+    def _on_composition_changed(self, composing: bool):
+        """Handle IME composition start/end."""
+        try:
+            self._is_composing = bool(composing)
+            self.controller._last_tick_monotonic = time.monotonic()
+        except Exception as e:
+            logger.error(f"Error handling composition change: {e}", exc_info=True)
 
     def _on_hide_remaining_toggled(self, hide: bool):
         """Hide or show the remaining list in the AnswerListPanel."""
@@ -485,99 +342,202 @@ class MainWindow(QMainWindow):
                 self.answer_lists.remaining_list.setVisible(visible)
             if hasattr(self.answer_lists, 'remaining_label'):
                 self.answer_lists.remaining_label.setVisible(visible)
+            
             # Refresh completer suggestions when unhidden
             if not hide and hasattr(self.game_state, 'update_answer_suggestions'):
-                try:
-                    al = getattr(self.controller, 'answer_list', None)
-                    if al is not None:
-                        remaining = [i for i in al.items if i not in al.used]
-                        self.game_state.update_answer_suggestions(list(remaining))
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                al = getattr(self.controller, 'answer_list', None)
+                if al is not None:
+                    remaining = [i for i in al.items if i not in al.used]
+                    self.game_state.update_answer_suggestions(list(remaining))
+        except Exception as e:
+            logger.error(f"Error toggling hide remaining: {e}", exc_info=True)
 
     def _on_sound_event(self, kind: str):
-        # kind is 'correct' or 'wrong'
+        """Handle sound events from controller."""
         if not getattr(self, '_sound_enabled', False):
             return
-        # Determine which config constant to use
-        sound_file = SOUND_CORRECT if kind == 'correct' else SOUND_WRONG
-        if not sound_exists(sound_file):
-            return
-        self._play_sound(sound_file, volume=0.9)
+        try:
+            sound_file = SOUND_CORRECT if kind == 'correct' else SOUND_WRONG
+            if sound_exists(sound_file):
+                self._play_sound(sound_file, volume=0.9)
+        except Exception as e:
+            logger.error(f"Error playing sound event: {e}", exc_info=True)
+
+    def _play_sound(self, filename: str, volume: float = 0.9) -> None:
+        """Play a sound file with caching to reduce latency."""
+        try:
+            if not getattr(self, '_sound_enabled', False):
+                return
+            if not sound_exists(filename):
+                return
+            
+            fname = get_sound_path(filename)
+            # Reuse cached player or create new one
+            pair = self._sound_players.get(filename)
+            if pair is None:
+                if len(self._sound_players) >= self._sound_player_cache_max:
+                    # Remove oldest cached player
+                    oldest_key = next(iter(self._sound_players))
+                    del self._sound_players[oldest_key]
+                
+                player = QMediaPlayer(self)
+                audio = QAudioOutput(self)
+                audio.setVolume(float(volume))
+                player.setAudioOutput(audio)
+                player.setSource(QUrl.fromLocalFile(fname))
+                self._sound_players[filename] = (player, audio)
+                pair = (player, audio)
+                
+                def _on_state_changed(state, player=player):
+                    try:
+                        if state == QMediaPlayer.StoppedState:
+                            player.setPosition(0)
+                    except Exception as e:
+                        logger.debug(f"Error resetting player position: {e}")
+                
+                try:
+                    player.playbackStateChanged.connect(_on_state_changed)
+                except Exception:
+                    pass
+            else:
+                player, audio = pair
+                try:
+                    audio.setVolume(float(volume))
+                except Exception:
+                    pass
+            
+            player, _ = self._sound_players[filename]
+            try:
+                player.setPosition(0)
+                player.play()
+            except Exception as e:
+                logger.error(f"Error playing sound: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Error in _play_sound: {e}", exc_info=True)
 
     def _on_player_state(self, player_name: str, remaining_ms: int, remaining_passes: int, remaining_wrong_answers: int, eliminated: bool):
-        if hasattr(self.player_panel, "on_player_state"):
-            self.player_panel.on_player_state(player_name, remaining_ms, remaining_passes, remaining_wrong_answers, eliminated)
-        # update big time display when the reported player is the current one
         try:
+            if hasattr(self.player_panel, "on_player_state"):
+                self.player_panel.on_player_state(player_name, remaining_ms, remaining_passes, remaining_wrong_answers, eliminated)
+            
             cur = self.controller.current_player()
-        except Exception:
-            cur = None
-        if cur and player_name == cur.name:
-            try:
-                self.game_state.set_remaining_ms(remaining_ms)
-            except Exception:
-                pass
-            # handle countdown beeps when enabled
-            try:
+            if cur and player_name == cur.name:
+                try:
+                    self.game_state.set_remaining_ms(remaining_ms)
+                except Exception:
+                    pass
+                
+                # Handle countdown beeps
                 if getattr(self, '_countdown_enabled', False):
-                    # remaining seconds (ceiling)
                     sec = int((remaining_ms + 999) // 1000)
-                    # only act when second changed to avoid repeated beeps within same second
                     if sec != getattr(self, '_last_countdown_second', None):
                         self._last_countdown_second = sec
-                        # when time reaches 0 use 'timeout' key
-                        if sec == 0:
-                            sound_file = COUNTDOWN_SOUNDS.get('timeout')
-                        else:
-                            sound_file = COUNTDOWN_SOUNDS.get(sec)
-
+                        sound_file = COUNTDOWN_SOUNDS.get('timeout') if sec == 0 else COUNTDOWN_SOUNDS.get(sec)
                         if sound_file and sound_exists(sound_file):
-                            # play configured sound (volume tuned slightly lower for countdown)
                             self._play_sound(sound_file, volume=0.8)
+        except Exception as e:
+            logger.error(f"Error handling player state: {e}", exc_info=True)
+
+    def _on_answers_updated(self, remaining, answered):
+        """Update answer lists and completer when answers change."""
+        try:
+            mm = {}
+            al = getattr(self.controller, 'answer_list', None)
+            if al is not None:
+                mm = getattr(al, '_match_map', {})
+            
+            formatted_rem = [f"{d}（{mm.get(d, '')}）" if mm.get(d) else str(d) for d in remaining]
+            formatted_ans = [f"{d}（{mm.get(d, '')}）" if mm.get(d) else str(d) for d in answered]
+            
+            self.answer_lists._remaining_keys = list(remaining)
+            self.answer_lists._answered_keys = list(answered)
+            self.answer_lists.on_answers_updated(formatted_rem, formatted_ans)
+            
+            if hasattr(self.game_state, "update_answer_suggestions"):
+                try:
+                    self.game_state._match_map = mm
+                    if getattr(self, '_hide_remaining', False):
+                        self.game_state.update_answer_suggestions([])
+                    else:
+                        self.game_state.update_answer_suggestions(list(remaining))
+                except Exception as e:
+                    logger.debug(f"Error updating answer suggestions: {e}")
+        except Exception as e:
+            logger.error(f"Error in _on_answers_updated: {e}", exc_info=True)
+
+    def _on_remaining_mark(self, text: str):
+        """Mark a remaining answer as correct (double-click handler)."""
+        try:
+            if not getattr(self.controller, 'is_running', False):
+                return
+            match_text = text
+            try:
+                if '（' in text and '）' in text:
+                    start = text.rfind('（')
+                    end = text.rfind('）')
+                    match_text = text[start+1:end]
+                else:
+                    mm = getattr(self.controller.answer_list, '_match_map', {})
+                    match_text = mm.get(text, text)
             except Exception:
                 pass
+            self.controller.host_submit_answer(match_text)
+        except Exception as e:
+            logger.error(f"Error marking answer: {e}", exc_info=True)
+
+    def _on_unmark_request(self, text: str):
+        """Move an answered item back to remaining."""
+        try:
+            if text:
+                self.controller.unmark_answer(text)
+        except Exception as e:
+            logger.error(f"Error unmarking answer: {e}", exc_info=True)
 
     def _on_answer_list_loaded(self, meta: dict):
-        # legacy hook: leave behavior to register_answers_updated if available
-        # otherwise reuse the existing controller.answer_list content
-        al = getattr(self.controller, "answer_list", None)
-        if al is None:
-            return
-        remaining = [i for i in al.items if i not in al.used]
-        answered = [i for i in al.items if i in al.used]
-        # format for display
+        """Handle answer list loading."""
         try:
-            mm = getattr(self.controller.answer_list, '_match_map', {})
-        except Exception:
-            mm = {}
-        formatted_rem = [f"{d}（{mm.get(d, '')}）" if mm.get(d) else str(d) for d in remaining]
-        formatted_ans = [f"{d}（{mm.get(d, '')}）" if mm.get(d) else str(d) for d in answered]
-        # update UI
-        try:
+            al = getattr(self.controller, "answer_list", None)
+            if al is None:
+                return
+            remaining = [i for i in al.items if i not in al.used]
+            answered = [i for i in al.items if i in al.used]
+            mm = getattr(al, '_match_map', {})
+            formatted_rem = [f"{d}（{mm.get(d, '')}）" if mm.get(d) else str(d) for d in remaining]
+            formatted_ans = [f"{d}（{mm.get(d, '')}）" if mm.get(d) else str(d) for d in answered]
             self.answer_lists.on_answers_updated(formatted_rem, formatted_ans)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Error in _on_answer_list_loaded: {e}", exc_info=True)
 
     def _on_running_state_changed(self, is_running: bool):
-        if hasattr(self.player_panel, "set_player_controls_enabled"):
-            self.player_panel.set_player_controls_enabled(not is_running)
-        if hasattr(self.game_state, "set_controls_enabled"):
-            # During game: disable start button, enable stop/pass
-            self.game_state.set_controls_enabled(not is_running)
-        # reset turn state when game stops
-        if not is_running:
+        """Update UI when game running state changes."""
+        try:
+            if hasattr(self.player_panel, "set_player_controls_enabled"):
+                self.player_panel.set_player_controls_enabled(not is_running)
+            if hasattr(self.game_state, "set_controls_enabled"):
+                self.game_state.set_controls_enabled(not is_running)
+            if not is_running:
+                self._player_remaining_at_turn_start.clear()
+        except Exception as e:
+            logger.error(f"Error handling running state change: {e}", exc_info=True)
+
+    def _on_current_player_changed(self, player_name):
+        """Update UI when current player changes."""
+        try:
+            if hasattr(self.player_panel, 'highlight_current_player'):
+                self.player_panel.highlight_current_player(player_name)
+            if hasattr(self.game_state, 'set_current_player'):
+                self.game_state.set_current_player(player_name)
             self._player_remaining_at_turn_start.clear()
+            keys_to_clear = [k for k in vars(self).keys() if k.startswith('_last_announced_intervals_') or k.startswith('_announced_timeout_')]
+            for k in keys_to_clear:
+                delattr(self, k)
+        except Exception as e:
+            logger.error(f"Error handling current player change: {e}", exc_info=True)
 
     def _on_tick_refresh(self):
-        # First, advance controller time if running
+        """Periodic UI refresh and controller tick."""
         try:
             if hasattr(self.controller, "tick"):
-                # if key-input pause enabled and either IME composition is active or
-                # last keypress is within the pause window, skip ticking but reset
-                # controller._last_tick_monotonic so elapsed doesn't accumulate
                 now = time.monotonic()
                 if getattr(self, '_keypause_enabled', False) and (getattr(self, '_is_composing', False) or now < getattr(self, '_keypause_until', 0)):
                     try:
@@ -586,15 +546,11 @@ class MainWindow(QMainWindow):
                         pass
                     return
                 self.controller.tick()
-        except Exception:
-            pass
-        # current player updates (name/time) are emitted via register_current_player
-        # and register_player_state callbacks; nothing else needed here.
-
-    # manual countdown pause removed; pause is controlled by typing/IME only
+        except Exception as e:
+            logger.error(f"Error in tick refresh: {e}", exc_info=True)
 
     def _on_save_csv(self):
-        """Save current answer state to CSV with timestamp replacement."""
+        """Save current answer state to CSV with timestamp."""
         try:
             import re
             from datetime import datetime
@@ -603,25 +559,23 @@ class MainWindow(QMainWindow):
                 self.notification_view.show_notification("error", "回答リストが読み込まれていません")
                 return
             
-            # Get answer list title from controller or use default
             title = getattr(self.controller, '_answer_list_title', 'answers')
-            
-            # Create output filename with current timestamp
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-
-            # Default save directory: data/answer_list
             save_dir = os.path.join(os.getcwd(), "data", "answer_list")
             os.makedirs(save_dir, exist_ok=True)
-
-            # If the provided title already ends with a timestamp suffix, strip it
-            # so we don't accumulate multiple timestamps in the name.
+            
             base_title = re.sub(r'_\d{14}$', '', title)
             output_filename = f"{base_title}_{timestamp}.csv"
-            
             output_path = os.path.join(save_dir, output_filename)
             
-            # Save to CSV (silently overwrites if file exists)
             al.save_to_csv(output_path)
             self.notification_view.show_notification("info", f"CSV保存: {output_filename}")
+        except FileNotFoundError as e:
+            logger.error(f"Save directory not found: {e}", exc_info=True)
+            self.notification_view.show_notification("error", f"CSV保存失敗: ディレクトリが見つかりません")
+        except IOError as e:
+            logger.error(f"IO error saving CSV: {e}", exc_info=True)
+            self.notification_view.show_notification("error", f"CSV保存失敗: ファイル書き込みエラー")
         except Exception as e:
+            logger.error(f"Error saving CSV: {e}", exc_info=True)
             self.notification_view.show_notification("error", f"CSV保存失敗: {str(e)}")
